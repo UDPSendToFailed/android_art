@@ -338,10 +338,7 @@ bool ShouldUseGenerationalGC() {
 }
 // Inter-Processor Interrupts (IPI), which are used for TLB flush, are very slow on
 // virtual devices, like cuttlefish. Therefore, we don't use MOVE ioctl on such devices.
-static const bool gMoveIoctlRequested =
-    com::android::art::rw::flags::use_uffd_move_ioctl_cmc_gc() &&
-    android::base::GetProperty("ro.hardware.virtual_device", "") != "1" &&
-    GetBoolProperty("persist.device_config.runtime_native_boot.use_uffd_move_ioctl", true);
+static const bool gMoveIoctlRequested = true;
 #else
 bool ShouldUseGenerationalGC() { return true; }
 static const bool gMoveIoctlRequested = true;
@@ -1101,87 +1098,31 @@ size_t MarkCompact::InitNonMovingFirstObjects(uintptr_t begin,
 }
 
 bool MarkCompact::MoveIoctlKernelCheck() {
-  DCHECK_GE(compaction_buffers_map_.Size(), 2 * gPageSize);
-  auto move_ioctl = [&](uint64_t additional_mode) {
-    uint8_t* buf = compaction_buffers_map_.Begin();
-    RegisterUffd(buf, gPageSize);
-    int ret = madvise(buf, gPageSize, MADV_DONTNEED);
-    CHECK(ret == 0) << "madvise failed: " << strerror(errno);
-    struct uffdio_move move_buf = {.dst = reinterpret_cast<uintptr_t>(buf),
-                                   .src = reinterpret_cast<uintptr_t>(buf) + gPageSize,
-                                   .len = gPageSize,
-                                   .mode = UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES | additional_mode,
-                                   .move = 0};
-    // If the ioctl succeeds (indicated by 0 return value) then we know seccomp filter
-    // allows it and we can use MOVE. Otherwise, we fallback to using COPY ioctl.
-    bool success = (ioctl(uffd_, UFFDIO_MOVE, &move_buf) == 0);
-    if (success) {
-      DCHECK_EQ(move_buf.move, static_cast<ssize_t>(gPageSize));
-    }
-    UnregisterUffd(buf, gPageSize);
-    return success;
-  };
-
-  if ((gUffdFeatures & UFFD_FEATURE_MOVE) != 0 && gMoveIoctlRequested) {
-    // MOVE ioctl isn't available before 6.1 even on target devices.
-    DCHECK(IsKernelVersionAtLeast(6, 1));
-    static bool safe_to_use_move = [&]() {
-      // Handle the case of no lts in the release by initializing to 0.
-      int major, minor, lts = 0;
-      struct utsname uts;
-      int ret = uname(&uts);
-      DCHECK_EQ(ret, 0);
-      DCHECK_EQ(strcmp(uts.sysname, "Linux"), 0);
-      ret = sscanf(uts.release, "%d.%d.%d:", &major, &minor, &lts);
-      CHECK_GE(ret, 2);
-      CHECK_GE(major, 6);
-      if (kIsTargetAndroid) {
-        if (std::make_pair(major, minor) <= std::make_pair(6, 6)) {
-          // Special mode added in 6.1 and 6.6 kernels to confirm that MOVE
-          // ioctl stability bugs and critical performance issues (anon_vma lock
-          // is removed from MOVE) are resolved in the kernel. In these kernels
-          // on devices, the ioctl should succeed with this additional mode. If
-          // it fails then we don't use MOVE ioctl (See:
-          // https://r.android.com/3834622 and https://r.android.com/3834623).
-          bool success = move_ioctl(1ull << 61);
-          if (!success) {
-            // The ioctl should fail only because the kernel doesn't have the
-            // bug-fixes and therefore the additional mode is not recognized.
-            CHECK_EQ(errno, EINVAL);
-            LOG(WARNING) << "userfaultfd: MOVE is not supported on the device: " << strerror(errno);
-          }
-          return success;
-        }
-        return true;
-      } else {
-        return major > 6 || minor > 13 || (minor == 13 && lts > 7) || (minor == 12 && lts > 19);
-      }
-    }();
-
-    if (safe_to_use_move) {
-      if (Runtime::Current()->IsZygote()) {
-        // No need to check for zygote.
-        return true;
-      } else {
-        // Invoke the ioctl in the app to see if its seccomp filter allows
-        // MOVE ioctl or not. This will be done only once during the first
-        // GC after fork.
-        // TODO (b/398036867): remove this code once we are sure that app-compat
-        // issues are taken care of.
-        bool ret = move_ioctl(/*additional_mode=*/0);
-        if (!ret) {
-          // TODO: add logic to also get reported on pitot as the below log
-          // message will get lost in the logcat.
-          LOG(WARNING) << "userfaultfd: MOVE is not supported: " << strerror(errno);
-        }
-        return ret;
-      }
-    } else {
-      return false;
-    }
-  } else {
+  // If the kernel didn't advertise MOVE, or our forced flag is false, bail out.
+  if ((gUffdFeatures & UFFD_FEATURE_MOVE) == 0 || !gMoveIoctlRequested) {
     return false;
   }
+
+  DCHECK_GE(compaction_buffers_map_.Size(), 2 * gPageSize);
+  
+  uint8_t* buf = compaction_buffers_map_.Begin();
+  RegisterUffd(buf, gPageSize);
+  int ret = madvise(buf, gPageSize, MADV_DONTNEED);
+  CHECK(ret == 0) << "madvise failed: " << strerror(errno);
+  
+  // Send the clean MOVE command without the 6.1 additional_mode hacks
+  struct uffdio_move move_buf = {.dst = reinterpret_cast<uintptr_t>(buf),
+                                 .src = reinterpret_cast<uintptr_t>(buf) + gPageSize,
+                                 .len = gPageSize,
+                                 .mode = UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES,
+                                 .move = 0};
+                                 
+  bool success = (ioctl(uffd_, UFFDIO_MOVE, &move_buf) == 0);
+  if (success) {
+    DCHECK_EQ(move_buf.move, static_cast<ssize_t>(gPageSize));
+  }
+  UnregisterUffd(buf, gPageSize);
+  return success;
 }
 
 // Generational CMC description
