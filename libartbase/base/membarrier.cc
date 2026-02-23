@@ -53,7 +53,7 @@ static bool IsMemBarrierSupported() {
   // MEMBARRIER_CMD_PRIVATE_EXPEDITED is supported since Linux 4.14.
   // MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE is supported since Linux 4.16.
   // Lowest Linux version useful for ART is 4.14.
-  return IsKernelVersionAtLeast(4, 14);
+  return true;
 }
 
 int membarrier(MembarrierCommand command) {
